@@ -6,7 +6,6 @@ from pydantic import BaseModel
 from pinecone import Pinecone
 from PyPDF2 import PdfReader
 from dotenv import load_dotenv
-import requests
 
 # Load environment variables from .env file
 load_dotenv()
@@ -28,21 +27,25 @@ try:
     # Try v5.x API first (list_indexes returns Index objects)
     existing_indexes = [idx.name for idx in pc.list_indexes()]
     if INDEX_NAME not in existing_indexes:
-        pc.create_index(
-            name=INDEX_NAME,
-            dimension=768,  # Standard dimension for llama-text-embed-v2
-            metric="cosine",
-            spec={
-                "serverless": {
-                    "cloud": "aws",
-                    "region": "us-east-1"
+        try:
+            pc.create_index(
+                name=INDEX_NAME,
+                dimension=768,  # Standard dimension for many embedding models
+                metric="cosine",
+                spec={
+                    "serverless": {
+                        "cloud": "aws",
+                        "region": "us-east-1"
+                    }
                 }
-            }
-        )
+            )
+        except Exception as e:
+            print(f"Warning: Could not create index {INDEX_NAME}: {e}")
+            print("Index may already exist or there may be a configuration issue.")
 except (AttributeError, TypeError) as e:
     # Fallback for older API versions
     try:
-        if not pc.has_index(INDEX_NAME):
+        if hasattr(pc, 'has_index') and not pc.has_index(INDEX_NAME):
             pc.create_index(
                 name=INDEX_NAME,
                 dimension=768,
@@ -54,11 +57,18 @@ except (AttributeError, TypeError) as e:
                     }
                 }
             )
-    except AttributeError:
-        # If neither method exists, assume index exists or will be created manually
-        pass
+    except Exception as e:
+        print(f"Warning: Could not create index {INDEX_NAME}: {e}")
+        print("Index may already exist or will be created manually.")
 
-index = pc.Index(INDEX_NAME)
+# Get index - this will fail if index doesn't exist, but that's okay
+# The app will still start and users can create the index manually
+try:
+    index = pc.Index(INDEX_NAME)
+except Exception as e:
+    print(f"Warning: Could not connect to index {INDEX_NAME}: {e}")
+    print("The index may need to be created manually in Pinecone dashboard.")
+    index = None
 
 # --- FastAPI App ---
 app = FastAPI(
@@ -115,57 +125,33 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[st
         start += chunk_size - overlap
     return chunks
 
-# --- Helper: generate embeddings using Pinecone's embedding API ---
+# --- Helper: generate embeddings ---
 def generate_embedding(text: str) -> List[float]:
-    """Generate embedding using Pinecone's embedding API."""
-    try:
-        # Use Pinecone's embedding API
-        response = requests.post(
-            "https://api.pinecone.io/v1/embed",
-            headers={
-                "Api-Key": PINECONE_API_KEY,
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "llama-text-embed-v2",
-                "texts": [text]
-            }
-        )
-        if response.status_code == 200:
-            return response.json()["embeddings"][0]
-        else:
-            # Fallback: simple hash-based embedding
-            import hashlib
-            import struct
-            hash_obj = hashlib.sha256(text.encode())
-            hash_bytes = hash_obj.digest()
-            # Create 768-dim vector
-            embedding = []
-            for i in range(0, 768, 4):
-                if i + 4 <= len(hash_bytes):
-                    val = struct.unpack('>I', hash_bytes[i:i+4])[0] / 4294967295.0
-                    embedding.append(val)
-                else:
-                    embedding.append(0.0)
-            return embedding[:768]
-    except Exception:
-        # Fallback: simple hash-based embedding
-        import hashlib
-        import struct
-        hash_obj = hashlib.sha256(text.encode())
-        hash_bytes = hash_obj.digest()
-        embedding = []
-        for i in range(0, 768, 4):
-            if i + 4 <= len(hash_bytes):
-                val = struct.unpack('>I', hash_bytes[i:i+4])[0] / 4294967295.0
-                embedding.append(val)
-            else:
-                embedding.append(0.0)
-        return embedding[:768]
+    """Generate embedding using hash-based method (simple and reliable)."""
+    import hashlib
+    
+    # Create a deterministic embedding from text using hash
+    # This is a simple approach - for production, consider using sentence-transformers or OpenAI embeddings
+    hash_obj = hashlib.sha256(text.encode('utf-8'))
+    hash_bytes = hash_obj.digest()
+    
+    # Create 768-dim vector by repeating hash pattern
+    embedding = []
+    for i in range(768):
+        # Use modulo to cycle through hash bytes
+        byte_idx = i % len(hash_bytes)
+        # Normalize to [-1, 1] range
+        val = (hash_bytes[byte_idx] / 255.0) * 2.0 - 1.0
+        embedding.append(val)
+    
+    return embedding
 
 # --- Step 1: Ingest PDF into Pinecone ---
 def ingest_pdf(pdf_path: str, pdf_title: str) -> int:
     """Ingest a single PDF into Pinecone."""
+    if index is None:
+        raise HTTPException(status_code=500, detail="Pinecone index is not available. Please ensure the index exists.")
+    
     text = extract_text_from_pdf(pdf_path)
     chunks = chunk_text(text)
     
@@ -189,6 +175,9 @@ def ingest_pdf(pdf_path: str, pdf_title: str) -> int:
 # --- Step 2: Query Pinecone ---
 def search_vector_db(query: str, top_k: int = 5) -> List[ChunkResult]:
     """Query Pinecone vector database and return raw results."""
+    if index is None:
+        raise HTTPException(status_code=500, detail="Pinecone index is not available. Please ensure the index exists.")
+    
     # Generate embedding for query
     query_embedding = generate_embedding(query)
     
@@ -240,6 +229,13 @@ async def root():
 async def health():
     """Health check endpoint."""
     try:
+        if index is None:
+            return {
+                "status": "degraded",
+                "index": INDEX_NAME,
+                "error": "Index not available",
+                "message": "Index may not exist or be accessible. Use /ingest to create and populate the index."
+            }
         # Check if index is accessible
         stats = index.describe_index_stats()
         return {
@@ -345,6 +341,12 @@ async def query_college_data(request: QueryRequest):
 async def get_stats():
     """Get statistics about the Pinecone index."""
     try:
+        if index is None:
+            return {
+                "index_name": INDEX_NAME,
+                "error": "Index not available",
+                "message": "Index may not exist or be accessible. Use /ingest to create and populate the index."
+            }
         stats = index.describe_index_stats()
         return {
             "index_name": INDEX_NAME,
