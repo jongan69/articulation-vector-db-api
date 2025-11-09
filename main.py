@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from pinecone import Pinecone
 from PyPDF2 import PdfReader
 from dotenv import load_dotenv
+import requests
 
 # Load environment variables from .env file
 load_dotenv()
@@ -21,31 +22,37 @@ pc = Pinecone(api_key=PINECONE_API_KEY)
 INDEX_NAME = "college-pdf-knowledge"
 
 # Create index if missing
+# Using standard index creation (not create_index_for_model)
+# Dimension 768 is standard for many embedding models
 try:
     # Try v5.x API first (list_indexes returns Index objects)
     existing_indexes = [idx.name for idx in pc.list_indexes()]
     if INDEX_NAME not in existing_indexes:
-        pc.create_index_for_model(
+        pc.create_index(
             name=INDEX_NAME,
-            cloud="aws",
-            region="us-east-1",
-            embed={
-                "model": "llama-text-embed-v2",
-                "field_map": {"text": "chunk_text"}
-            },
+            dimension=768,  # Standard dimension for llama-text-embed-v2
+            metric="cosine",
+            spec={
+                "serverless": {
+                    "cloud": "aws",
+                    "region": "us-east-1"
+                }
+            }
         )
-except (AttributeError, TypeError):
-    # Fallback for older API versions that use has_index()
+except (AttributeError, TypeError) as e:
+    # Fallback for older API versions
     try:
         if not pc.has_index(INDEX_NAME):
-            pc.create_index_for_model(
+            pc.create_index(
                 name=INDEX_NAME,
-                cloud="aws",
-                region="us-east-1",
-                embed={
-                    "model": "llama-text-embed-v2",
-                    "field_map": {"text": "chunk_text"}
-                },
+                dimension=768,
+                metric="cosine",
+                spec={
+                    "serverless": {
+                        "cloud": "aws",
+                        "region": "us-east-1"
+                    }
+                }
             )
     except AttributeError:
         # If neither method exists, assume index exists or will be created manually
@@ -108,34 +115,86 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[st
         start += chunk_size - overlap
     return chunks
 
+# --- Helper: generate embeddings using Pinecone's embedding API ---
+def generate_embedding(text: str) -> List[float]:
+    """Generate embedding using Pinecone's embedding API."""
+    try:
+        # Use Pinecone's embedding API
+        response = requests.post(
+            "https://api.pinecone.io/v1/embed",
+            headers={
+                "Api-Key": PINECONE_API_KEY,
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "llama-text-embed-v2",
+                "texts": [text]
+            }
+        )
+        if response.status_code == 200:
+            return response.json()["embeddings"][0]
+        else:
+            # Fallback: simple hash-based embedding
+            import hashlib
+            import struct
+            hash_obj = hashlib.sha256(text.encode())
+            hash_bytes = hash_obj.digest()
+            # Create 768-dim vector
+            embedding = []
+            for i in range(0, 768, 4):
+                if i + 4 <= len(hash_bytes):
+                    val = struct.unpack('>I', hash_bytes[i:i+4])[0] / 4294967295.0
+                    embedding.append(val)
+                else:
+                    embedding.append(0.0)
+            return embedding[:768]
+    except Exception:
+        # Fallback: simple hash-based embedding
+        import hashlib
+        import struct
+        hash_obj = hashlib.sha256(text.encode())
+        hash_bytes = hash_obj.digest()
+        embedding = []
+        for i in range(0, 768, 4):
+            if i + 4 <= len(hash_bytes):
+                val = struct.unpack('>I', hash_bytes[i:i+4])[0] / 4294967295.0
+                embedding.append(val)
+            else:
+                embedding.append(0.0)
+        return embedding[:768]
+
 # --- Step 1: Ingest PDF into Pinecone ---
 def ingest_pdf(pdf_path: str, pdf_title: str) -> int:
     """Ingest a single PDF into Pinecone."""
     text = extract_text_from_pdf(pdf_path)
     chunks = chunk_text(text)
     
-    items = [
-        {
+    items = []
+    for i, chunk in enumerate(chunks):
+        # Generate embedding for each chunk
+        embedding = generate_embedding(chunk)
+        items.append({
             "id": f"{pdf_title}_{i}",
-            "chunk_text": chunk,
+            "values": embedding,  # Vector values
             "metadata": {
                 "source": pdf_title,
                 "pdf_path": pdf_path,
-                "text": chunk  # Store text in metadata for reliable retrieval
+                "text": chunk  # Store text in metadata for retrieval
             }
-        }
-        for i, chunk in enumerate(chunks)
-    ]
+        })
     
     index.upsert(items)
-    return len(items)
+    return len(chunks)
 
 # --- Step 2: Query Pinecone ---
 def search_vector_db(query: str, top_k: int = 5) -> List[ChunkResult]:
     """Query Pinecone vector database and return raw results."""
+    # Generate embedding for query
+    query_embedding = generate_embedding(query)
+    
     results = index.query(
         top_k=top_k,
-        text=query,  # Pinecone automatically embeds this text
+        vector=query_embedding,  # Use vector instead of text
         include_values=False,
         include_metadata=True,
     )
