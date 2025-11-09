@@ -189,7 +189,13 @@ async def health():
             "index_stats": stats
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Health check failed: {str(e)}")
+        # Return partial health status instead of failing completely
+        return {
+            "status": "degraded",
+            "index": INDEX_NAME,
+            "error": str(e),
+            "message": "Index may not exist or be accessible. Use /ingest to create and populate the index."
+        }
 
 @app.post("/ingest", response_model=IngestResponse)
 async def ingest_pdfs(request: Optional[IngestRequest] = None):
@@ -206,10 +212,20 @@ async def ingest_pdfs(request: Optional[IngestRequest] = None):
         # Ingest all PDFs in pdfs/ folder
         pdf_files = glob.glob(f"{pdfs_dir}/*.pdf")
         if not pdf_files:
-            raise HTTPException(status_code=404, detail=f"No PDF files found in {pdfs_dir}/")
+            # Check if directory exists
+            if not os.path.exists(pdfs_dir):
+                raise HTTPException(
+                    status_code=404, 
+                    detail=f"PDFs directory '{pdfs_dir}/' not found on server. PDFs need to be uploaded to the server or accessed from cloud storage."
+                )
+            raise HTTPException(
+                status_code=404, 
+                detail=f"No PDF files found in {pdfs_dir}/. Make sure PDFs are available on the server."
+            )
     
     total_chunks = 0
     processed_pdfs = []
+    errors = []
     
     for pdf_file in pdf_files:
         try:
@@ -219,11 +235,23 @@ async def ingest_pdfs(request: Optional[IngestRequest] = None):
             processed_pdfs.append(pdf_title)
         except Exception as e:
             # Continue with other PDFs even if one fails
-            print(f"Error ingesting {pdf_file}: {str(e)}")
+            error_msg = f"Error ingesting {pdf_file}: {str(e)}"
+            errors.append(error_msg)
+            print(error_msg)
             continue
     
+    if not processed_pdfs:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to ingest any PDFs. Errors: {'; '.join(errors) if errors else 'Unknown error'}"
+        )
+    
+    message = f"Successfully ingested {len(processed_pdfs)} PDF(s) with {total_chunks} total chunks"
+    if errors:
+        message += f". {len(errors)} PDF(s) failed to ingest."
+    
     return IngestResponse(
-        message=f"Successfully ingested {len(processed_pdfs)} PDF(s) with {total_chunks} total chunks",
+        message=message,
         ingested_count=total_chunks,
         pdfs_processed=processed_pdfs
     )
@@ -264,7 +292,11 @@ async def get_stats():
             "stats": stats
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get stats: {str(e)}")
+        return {
+            "index_name": INDEX_NAME,
+            "error": str(e),
+            "message": "Index may not exist or be accessible. Use /ingest to create and populate the index."
+        }
 
 # --- Example usage ---
 if __name__ == "__main__":
