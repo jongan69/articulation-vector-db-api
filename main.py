@@ -22,7 +22,7 @@ INDEX_NAME = "college-pdf-knowledge"
 
 # Create index if missing
 # Using standard index creation (not create_index_for_model)
-# Dimension 768 is standard for many embedding models
+# Dimension 1024 matches existing index (or use 768 for new indexes)
 try:
     # Try v5.x API first (list_indexes returns Index objects)
     existing_indexes = [idx.name for idx in pc.list_indexes()]
@@ -30,7 +30,7 @@ try:
         try:
             pc.create_index(
                 name=INDEX_NAME,
-                dimension=768,  # Standard dimension for many embedding models
+                dimension=1024,  # Match existing index dimension
                 metric="cosine",
                 spec={
                     "serverless": {
@@ -48,7 +48,7 @@ except (AttributeError, TypeError) as e:
         if hasattr(pc, 'has_index') and not pc.has_index(INDEX_NAME):
             pc.create_index(
                 name=INDEX_NAME,
-                dimension=768,
+                dimension=1024,  # Match existing index dimension
                 metric="cosine",
                 spec={
                     "serverless": {
@@ -135,9 +135,9 @@ def generate_embedding(text: str) -> List[float]:
     hash_obj = hashlib.sha256(text.encode('utf-8'))
     hash_bytes = hash_obj.digest()
     
-    # Create 768-dim vector by repeating hash pattern
+    # Create 1024-dim vector by repeating hash pattern (matching existing index dimension)
     embedding = []
-    for i in range(768):
+    for i in range(1024):
         # Use modulo to cycle through hash bytes
         byte_idx = i % len(hash_bytes)
         # Normalize to [-1, 1] range
