@@ -21,16 +21,35 @@ pc = Pinecone(api_key=PINECONE_API_KEY)
 INDEX_NAME = "college-pdf-knowledge"
 
 # Create index if missing
-if not pc.has_index(INDEX_NAME):
-    pc.create_index_for_model(
-        name=INDEX_NAME,
-        cloud="aws",
-        region="us-east-1",
-        embed={
-            "model": "llama-text-embed-v2",
-            "field_map": {"text": "chunk_text"}
-        },
-    )
+try:
+    # Try v5.x API first (list_indexes returns Index objects)
+    existing_indexes = [idx.name for idx in pc.list_indexes()]
+    if INDEX_NAME not in existing_indexes:
+        pc.create_index_for_model(
+            name=INDEX_NAME,
+            cloud="aws",
+            region="us-east-1",
+            embed={
+                "model": "llama-text-embed-v2",
+                "field_map": {"text": "chunk_text"}
+            },
+        )
+except (AttributeError, TypeError):
+    # Fallback for older API versions that use has_index()
+    try:
+        if not pc.has_index(INDEX_NAME):
+            pc.create_index_for_model(
+                name=INDEX_NAME,
+                cloud="aws",
+                region="us-east-1",
+                embed={
+                    "model": "llama-text-embed-v2",
+                    "field_map": {"text": "chunk_text"}
+                },
+            )
+    except AttributeError:
+        # If neither method exists, assume index exists or will be created manually
+        pass
 
 index = pc.Index(INDEX_NAME)
 
